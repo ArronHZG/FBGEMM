@@ -15,7 +15,8 @@
 
 #include "SynchronizedShardedMap.h"
 #include "deeplearning/fbgemm/fbgemm_gpu/src/ssd_split_embeddings_cache/initializer.h"
-#include "store_value_utils.h"
+#include "fixed_block_pool.h"
+#include "feature_evict.h"
 
 #include <ATen/core/ivalue.h>
 #include <caffe2/torch/fb/distributed/wireSerializer/WireSerializer.h>
@@ -46,6 +47,7 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
   /// @param max_D the maximum dimension of of embedding tensor
   /// @param uniform_init_lower the lower bound of the uniform distribution
   /// @param uniform_init_upper the upper bound of the uniform distribution
+  /// @param feature_evict_config feature evict config
   /// @param num_shards number of shards for the kvstore. This is to improve
   /// parallelization. Each key value pair will be sharded into one shard.
   /// @param num_threads num of threads that kvstore needs to be run upon for
@@ -59,6 +61,7 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
       int64_t max_D,
       double uniform_init_lower,
       double uniform_init_upper,
+      FeatureEvictConfig feature_evict_config,
       int64_t num_shards = 8,
       int64_t num_threads = 32,
       int64_t row_storage_bitwidth = 32,
@@ -68,10 +71,11 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
             max_D,
             0), // l2_cache_size_gb =0 to disable l2 cache
         max_D_(max_D),
+        feature_evict_config_(feature_evict_config),
         num_shards_(num_shards),
         weight_ttl_in_hours_(weight_ttl_in_hours),
-        block_size_(StoreValueUtils::calculate_block_size<weight_type>(max_D)),
-        block_alignment_(StoreValueUtils::calculate_block_alignment<weight_type>()),
+        block_size_(FixedBlockPool::calculate_block_size<weight_type>(max_D)),
+        block_alignment_(FixedBlockPool::calculate_block_alignment<weight_type>()),
         kv_store_(SynchronizedShardedMap<int64_t, weight_type*>(
             num_shards_,
             block_size_,
@@ -86,6 +90,9 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
         uniform_init_lower,
         uniform_init_upper,
         row_storage_bitwidth);
+    if (feature_evict_config_.trigger_mode != EvictTriggerMode::DISABLED) {
+      feature_evict_ = create_feature_evict(feature_evict_config_, executor_.get(), kv_store_, max_D);
+    }
   }
 
   void initialize_initializers(
@@ -205,12 +212,13 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
                             block = it->second;
                           } else {
                             // Key doesn't exist, allocate new block and insert.
-                            block = StoreValueUtils::allocate<weight_type>(
-                                block_size_, block_alignment_, pool);
+                            block = pool->allocate_t();
                             wlmap->insert({id, block});
                           }
-                          StoreValueUtils::update_timestamp<weight_type>(block);
-                          auto* data_ptr = StoreValueUtils::data_ptr<weight_type>(block);
+                          if (feature_evict_) {
+                            feature_evict_->update_feature_statistics(block);
+                          }
+                          auto* data_ptr = FixedBlockPool::data_ptr<weight_type>(block);
                           std::copy(weights[id_index]
                                         .template data_ptr<weight_type>(),
                                     weights[id_index]
@@ -295,12 +303,11 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
                             continue;
                           }
                           // use mempool
-                          const auto* data_ptr = StoreValueUtils::data_ptr<weight_type>(cached_iter->second);
-                          StoreValueUtils::update_timestamp(cached_iter->second);
+                          const auto* data_ptr = FixedBlockPool::data_ptr<weight_type>(cached_iter->second);
                           std::copy(
                               data_ptr,
                               data_ptr + max_D_,
-                              &(weights_data_ptr[index * max_D_]));  // dst_start
+                              &(weights_data_ptr[id_index * max_D_]));  // dst_start
                         }
                       }
                     });
@@ -321,6 +328,32 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
   }
 
   void compact() override {}
+
+  void trigger_feature_evict() {
+    if (feature_evict_) {
+      feature_evict_->trigger_evict();
+    }
+  }
+
+  void feature_evict_resume() {
+    if (feature_evict_) {
+      feature_evict_->resume();
+    }
+  }
+
+  void feature_evict_pause() {
+    if (feature_evict_) {
+      feature_evict_->pause();
+    }
+  }
+
+  void maybe_evict_by_step() {
+    if (feature_evict_config_.trigger_mode == EvictTriggerMode::ITERATION &&
+        feature_evict_config_.trigger_step_interval > 0 &&
+        ++current_iter_ % feature_evict_config_.trigger_step_interval == 0) {
+      trigger_feature_evict();
+    }
+  }
 
  private:
   void fill_from_row_storage(
@@ -390,6 +423,9 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
   std::atomic_bool is_eviction_ongoing_ = false;
   std::vector<std::unique_ptr<ssd::Initializer>> initializers_;
   int64_t elem_size_;
+  FeatureEvictConfig feature_evict_config_;
+  std::unique_ptr<FeatureEvict<weight_type>> feature_evict_;
+  int current_iter_ = 0;
 }; // class DramKVEmbeddingCache
 
 } // namespace kv_mem
