@@ -1,9 +1,10 @@
 #pragma once
-
 #include <chrono>
 #include <cstddef>
+#include <fstream>
 #include <memory_resource>
 #include <stdexcept>
+#include <string>
 #include <vector>
 #include <cmath>
 #include <numeric>
@@ -54,9 +55,7 @@ class FixedBlockPool : public std::pmr::memory_resource {
   // timestamp operations
   static uint32_t get_timestamp(const void* block) { return reinterpret_cast<const MetaHeader*>(block)->timestamp; }
   static void update_timestamp(void* block) { reinterpret_cast<MetaHeader*>(block)->timestamp = current_timestamp(); }
-  static uint32_t current_timestamp() {
-    return std::time(nullptr);
-  }
+  static uint32_t current_timestamp() { return std::time(nullptr); }
 
   // Calculate storage size
   template <typename scalar_t>
@@ -163,6 +162,71 @@ class FixedBlockPool : public std::pmr::memory_resource {
     return (block_size_ + block_alignment_ - 1) / block_alignment_ * block_alignment_;
   }
 
+  void serialize(const std::string& filename) const {
+    std::ofstream out(filename, std::ios::binary);
+    if (!out) {
+      throw std::runtime_error("Failed to open file for writing");
+    }
+    // 写入元数据
+    out.write(reinterpret_cast<const char*>(&block_size_), sizeof(block_size_));
+    out.write(reinterpret_cast<const char*>(&block_alignment_), sizeof(block_alignment_));
+    out.write(reinterpret_cast<const char*>(&blocks_per_chunk_), sizeof(blocks_per_chunk_));
+    const size_t num_chunks = chunks_.size();
+    out.write(reinterpret_cast<const char*>(&num_chunks), sizeof(num_chunks));
+
+    // 写入每个 chunk 的数据
+    for (const auto& chunk : chunks_) {
+      assert(chunk.size == block_size_ * blocks_per_chunk_);
+      out.write(static_cast<const char*>(chunk.ptr), static_cast<long>(chunk.size));
+    }
+    out.flush();
+    out.close();
+  }
+
+  // 从文件反序列化
+  void deserialize(const std::string& filename) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) {
+      throw std::runtime_error("Failed to open file for reading");
+    }
+
+    // 读取元数据
+    std::size_t block_size, block_alignment, blocks_per_chunk, num_chunks;
+    in.read(reinterpret_cast<char*>(&block_size), sizeof(block_size));
+    in.read(reinterpret_cast<char*>(&block_alignment), sizeof(block_alignment));
+    in.read(reinterpret_cast<char*>(&blocks_per_chunk), sizeof(blocks_per_chunk));
+    in.read(reinterpret_cast<char*>(&num_chunks), sizeof(num_chunks));
+
+    // 验证参数合法性
+    if (block_size != block_size_) {
+      throw std::invalid_argument("Invalid block_size in file");
+    }
+    if (block_alignment != block_alignment_) {
+      throw std::invalid_argument("Invalid block_alignment in file");
+    }
+    if (blocks_per_chunk != blocks_per_chunk_) {
+      throw std::invalid_argument("Invalid blocks_per_chunk_ in file");
+    }
+
+    // 读取每个 chunk 的数据并重建内存结构
+    const std::size_t chunk_size = block_size_ * blocks_per_chunk_;
+    for (size_t i = 0; i < num_chunks; ++i) {
+      void* chunk_ptr = upstream_->allocate(chunk_size, block_alignment_);
+      in.read(static_cast<char*>(chunk_ptr), static_cast<long>(chunk_size));
+      // 将 chunk 添加到内存池
+      chunks_.push_back({chunk_ptr, chunk_size, block_alignment});
+      // 重建 free_list_
+      char* current = static_cast<char*>(chunk_ptr);
+      for (size_t j = 0; j < blocks_per_chunk; ++j) {
+        void* block = current + j * block_size;
+        if (!get_used(block)) {
+          do_deallocate(block, block_size_, block_alignment_);
+        }
+      }
+    }
+    in.close();
+  }
+
  protected:
   // Core allocation function
   void* do_allocate(std::size_t bytes, std::size_t alignment) override {
@@ -192,7 +256,9 @@ class FixedBlockPool : public std::pmr::memory_resource {
   }
 
   // Resource equality comparison (only the same object is equal)
-  [[nodiscard]] bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+  [[nodiscard]] bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+    return this == &other;
+  }
 
  private:
   // Allocate a new memory chunk
