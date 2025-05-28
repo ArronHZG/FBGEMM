@@ -123,6 +123,10 @@ class DramKVEmbeddingCacheWrapper : public torch::jit::CustomClassHolder {
     return impl_->get_keys_in_range(start, end);
   }
 
+  size_t get_map_used_memsize() const {
+    return impl_->get_map_used_memsize();
+  }
+
  private:
   // friend class EmbeddingRocksDBWrapper;
   friend class ssd::KVTensorWrapper;

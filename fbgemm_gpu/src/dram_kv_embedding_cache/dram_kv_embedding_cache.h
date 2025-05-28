@@ -355,6 +355,10 @@ class DramKVEmbeddingCache : public kv_db::EmbeddingKVDB {
     }
   }
 
+  size_t get_map_used_memsize() const {
+    return kv_store_.getUsedMemSize();
+  }
+
  private:
   void fill_from_row_storage(
       int shard_id,
