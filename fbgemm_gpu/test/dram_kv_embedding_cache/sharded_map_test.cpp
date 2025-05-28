@@ -171,6 +171,59 @@ int benchmark() {
   }
   return 0;
 }
+
+void save_and_restore() {
+  const int numShards = 4;
+  const std::size_t dimension = 32;
+  const std::size_t block_size = FixedBlockPool::calculate_block_size<float>(dimension);
+  const std::size_t block_alignment = FixedBlockPool::calculate_block_alignment<float>();
+  const int numItems = 1'000'000;
+  const std::string filename = "test_map.bin";
+
+  SynchronizedShardedMap<int64_t, float*> original_map(numShards, block_size, block_alignment);
+
+  std::vector<float> test_embedding = generateFixedEmbedding(dimension);
+  for (int i = 0; i < numItems; ++i) {
+    int shard_id = i % numShards;
+    auto wlock = original_map.by(shard_id).wlock();
+    auto* pool = original_map.pool_by(shard_id);
+
+    auto* block = pool->allocate_t<float>();
+    auto* data_ptr = FixedBlockPool::data_ptr<float>(block);
+    std::copy(test_embedding.begin(), test_embedding.end(), data_ptr);
+
+    FixedBlockPool::set_key(block, i);
+    wlock->insert({i, block});
+  }
+
+  original_map.save(filename);
+
+  SynchronizedShardedMap<int64_t, float*> restored_map(numShards, block_size, block_alignment);
+  restored_map.load(filename);
+
+  for (int64_t i = 0; i < numItems; ++i) {
+    int shard_id = i % numShards;
+    auto rlock = restored_map.by(shard_id).rlock();
+
+    auto it = rlock->find(i);
+    ASSERT_NE(it, rlock->end()) << "Key " << i << " not found after load";
+
+    float* block = it->second;
+    ASSERT_EQ(FixedBlockPool::get_key(block), i);
+
+    const float* data_ptr = FixedBlockPool::data_ptr<float>(block);
+    for (std::size_t j = 0; j < dimension; ++j) {
+      ASSERT_FLOAT_EQ(data_ptr[j], test_embedding[j]) << "Data mismatch at position " << j << " for key " << i;
+    }
+  }
+
+  std::remove(filename.c_str());
+  for (int i = 0; i < numShards; ++i) {
+    std::remove((filename + ".pool." + std::to_string(i)).c_str());
+  }
+};
+
+TEST(SynchronizedShardedMap, save_and_restore) { save_and_restore(); }
 TEST(SynchronizedShardedMap, benchmark) { benchmark(); }
 
 }  // namespace kv_mem
