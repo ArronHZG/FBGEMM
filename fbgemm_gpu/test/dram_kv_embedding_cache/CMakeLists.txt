@@ -5,17 +5,20 @@ include_directories(
         ${FBGEMM_SOURCE_DIR}
 )
 
-add_executable(fixed_block_pool_test ${CMAKE_CURRENT_SOURCE_DIR}/fixed_block_pool_test.cpp)
-target_compile_features(fixed_block_pool_test PUBLIC cxx_std_17)
-target_compile_options(fixed_block_pool_test PUBLIC "-O3")
-target_link_libraries(fixed_block_pool_test gtest gtest_main Folly::folly)
+set(COMMON_COMPILE_FEATURES cxx_std_17)
+set(COMMON_COMPILE_OPTIONS "-O3")
+set(COMMON_LINK_LIBRARIES gtest gtest_main Folly::folly)
 
-add_executable(sharded_map_test ${CMAKE_CURRENT_SOURCE_DIR}/sharded_map_test.cpp)
-target_compile_features(sharded_map_test PUBLIC cxx_std_17)
-target_compile_options(sharded_map_test PUBLIC "-O3")
-target_link_libraries(sharded_map_test gtest gtest_main Folly::folly)
+set(TEST_TARGETS
+        fixed_block_pool_test
+        fixed_block_pool_saver_test
+        sharded_map_test
+        feature_evict_test
+)
 
-add_executable(feature_evict_test ${CMAKE_CURRENT_SOURCE_DIR}/feature_evict_test.cpp)
-target_compile_features(feature_evict_test PUBLIC cxx_std_17)
-target_compile_options(feature_evict_test PUBLIC "-O3")
-target_link_libraries(feature_evict_test gtest gtest_main Folly::folly)
+foreach (target ${TEST_TARGETS})
+    add_executable(${target} ${CMAKE_CURRENT_SOURCE_DIR}/${target}.cpp)
+    target_compile_features(${target} PUBLIC ${COMMON_COMPILE_FEATURES})
+    target_compile_options(${target} PUBLIC ${COMMON_COMPILE_OPTIONS})
+    target_link_libraries(${target} ${COMMON_LINK_LIBRARIES})
+endforeach ()
