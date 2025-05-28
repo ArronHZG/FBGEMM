@@ -15,8 +15,8 @@ void removeFileIfExists(const std::string& filename) {
 }
 class FixedBlockPoolTest : public ::testing::Test {
  protected:
-  static constexpr size_t kDimension = 128;  // embedding维度
-  using scalar_t = float;                    // 数据类型
+  static constexpr size_t kDimension = 128;  // embedding dimension
+  using scalar_t = float;                    // data type
 
   void SetUp() override {
     block_size_ = kv_mem::FixedBlockPool::calculate_block_size<scalar_t>(kDimension);
@@ -24,7 +24,7 @@ class FixedBlockPoolTest : public ::testing::Test {
     pool_ = std::make_unique<kv_mem::FixedBlockPool>(block_size_, block_alignment_);
   }
 
-  // 生成随机数据
+  // Generate random data
   void generateRandomData(std::size_t num_blocks) {
     std::random_device rd;
     std::mt19937 gen(rd());
@@ -35,27 +35,27 @@ class FixedBlockPoolTest : public ::testing::Test {
       auto* block = pool_->allocate_t<scalar_t>();
       uint64_t key = key_dist(gen);
 
-      // 设置元数据
+      // Set metadata
       kv_mem::FixedBlockPool::set_key(block, key);
       kv_mem::FixedBlockPool::set_count(block, i % 100);
       kv_mem::FixedBlockPool::update_timestamp(block);
 
-      // 设置embedding数据
+      // Set embedding data
       auto* data = kv_mem::FixedBlockPool::data_ptr(block);
       for (size_t j = 0; j < kDimension; ++j) {
         data[j] = val_dist(gen);
       }
 
-      // 记录用于验证
+      // Record for verification
       original_data_[key] = std::vector<scalar_t>(data, data + kDimension);
     }
   }
 
-  // 验证数据正确性
+  // Verify data correctness
   bool verifyData() {
     size_t verified_count = 0;
 
-    // 遍历所有chunks验证数据
+    // Traverse all chunks to verify data
     for (const auto& chunk : pool_->get_chunks()) {
       char* current = static_cast<char*>(chunk.ptr);
       size_t blocks_in_chunk = chunk.size / block_size_;
@@ -66,7 +66,7 @@ class FixedBlockPoolTest : public ::testing::Test {
           uint64_t key = kv_mem::FixedBlockPool::get_key(block);
           auto* data = kv_mem::FixedBlockPool::data_ptr(reinterpret_cast<scalar_t*>(block));
 
-          // 查找并比较原始数据
+          // Find and compare original data
           auto it = original_data_.find(key);
           if (it == original_data_.end()) {
             return false;
@@ -84,7 +84,7 @@ class FixedBlockPoolTest : public ::testing::Test {
     return verified_count == original_data_.size();
   }
 
-  // 性能测试辅助函数
+  // Performance test helper function
   template <typename Func>
   double measureTime(Func&& func) {
     auto start = std::chrono::high_resolution_clock::now();
@@ -99,71 +99,59 @@ class FixedBlockPoolTest : public ::testing::Test {
   std::unordered_map<uint64_t, std::vector<scalar_t>> original_data_;
 };
 
-// 正确性测试
+// Correctness test
 TEST_F(FixedBlockPoolTest, SerializationCorrectness) {
-  // 1. 生成随机数据
+  // 1. Generate random data
   generateRandomData(1000);
 
-  // 2. 序列化
+  // 2. Serialize
   const std::string filename = "test_pool.bin";
   pool_->serialize(filename);
 
-  // 3. 创建新的内存池并反序列化
+  // 3. Create a new memory pool and deserialize
   auto new_pool = std::make_unique<kv_mem::FixedBlockPool>(block_size_, block_alignment_);
   new_pool->deserialize(filename);
 
-  // 4. 验证数据
+  // 4. Verify data
   pool_ = std::move(new_pool);
   EXPECT_TRUE(verifyData());
 }
 
-// 边界条件测试
+// Edge case test
 TEST_F(FixedBlockPoolTest, SerializationEdgeCases) {
-  // 1. 空池序列化测试
+  // 1. Empty pool serialization test
   const std::string empty_filename = "empty_pool.bin";
   pool_->serialize(empty_filename);
 
   auto new_pool = std::make_unique<kv_mem::FixedBlockPool>(block_size_, block_alignment_);
   EXPECT_NO_THROW(new_pool->deserialize(empty_filename));
 
-  // 2. 文件不存在测试
+  // 2. File not found test
   EXPECT_THROW(pool_->deserialize("nonexistent_file.bin"), std::runtime_error);
 
-  // 3. 参数不匹配测试
+  // 3. Parameter mismatch test
   generateRandomData(1000);
   const std::string filename = "test_pool.bin";
   pool_->serialize(filename);
 
-  auto wrong_pool = std::make_unique<kv_mem::FixedBlockPool>(block_size_ * 2,  // 错误的block大小
+  auto wrong_pool = std::make_unique<kv_mem::FixedBlockPool>(block_size_ * 2,  // Incorrect block size
                                                              block_alignment_);
   EXPECT_THROW(wrong_pool->deserialize(filename), std::invalid_argument);
 }
 
-// 性能测试
+// Performance test
 TEST_F(FixedBlockPoolTest, SerializationPerformance) {
-  // 1. 生成随机数据
   const std::size_t num_blocks = 20'000'000;
   generateRandomData(num_blocks);
   const std::string filename = "test_pool.bin";
   removeFileIfExists(filename);
 
-  // 2. 测试序列化性能
-  double serialize_time = measureTime([&]() { pool_->serialize(filename); });
+  pool_->serialize(filename);
 
-  // 3. 测试反序列化性能
-  double deserialize_time = measureTime([&]() {
-    auto new_pool = std::make_unique<kv_mem::FixedBlockPool>(block_size_, block_alignment_);
-    new_pool->deserialize(filename);
-  });
+  auto new_pool = std::make_unique<kv_mem::FixedBlockPool>(block_size_, block_alignment_);
+  new_pool->deserialize(filename);
 
-  // 4. 输出性能数据
-  double data_size_mb = static_cast<double>((block_size_ * num_blocks)) / (1024.0 * 1024.0);
-  std::cout << "\nPerformance Results:" << std::endl;
-  std::cout << "Data size: " << data_size_mb << " MB" << std::endl;
-  std::cout << "Serialization time: " << serialize_time << " seconds" << std::endl;
-  std::cout << "Serialization throughput: " << (data_size_mb / serialize_time) << " MB/s" << std::endl;
-  std::cout << "Deserialization time: " << deserialize_time << " seconds" << std::endl;
-  std::cout << "Deserialization throughput: " << (data_size_mb / deserialize_time) << " MB/s" << std::endl;
+  std::remove(filename.c_str());
 }
 
 }  // namespace kv_mem

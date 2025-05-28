@@ -3,13 +3,14 @@
 #include <cstddef>
 #include <fstream>
 #include <memory_resource>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <cmath>
-#include <numeric>
 
 #include <cassert>
+#include <cmath>
+#include <fmt/format.h>
 
 namespace kv_mem {
 static constexpr uint32_t kMaxInt31Counter = 2147483647;
@@ -83,9 +84,8 @@ class FixedBlockPool : public std::pmr::memory_resource {
   template <typename scalar_t>
   static scalar_t get_l2weight(scalar_t* block, size_t dimension) {
     scalar_t* data = FixedBlockPool::data_ptr(block);
-    return std::sqrt(
-        std::accumulate(data, data + dimension, scalar_t(0),
-                        [](scalar_t sum, scalar_t val) { return sum + val * val; }));
+    return std::sqrt(std::accumulate(
+        data, data + dimension, scalar_t(0), [](scalar_t sum, scalar_t val) { return sum + val * val; }));
   }
 
   explicit FixedBlockPool(std::size_t block_size,               // Size of each memory block
@@ -154,50 +154,68 @@ class FixedBlockPool : public std::pmr::memory_resource {
     }
   };
 
-  [[nodiscard]] const auto& get_chunks() const noexcept { return chunks_; }
-  [[nodiscard]] std::size_t get_block_size() const noexcept { return block_size_; }
-  [[nodiscard]] std::size_t get_block_alignment() const noexcept { return block_alignment_; }
-  [[nodiscard]] std::size_t get_blocks_per_chunk() const noexcept { return blocks_per_chunk_; }
-  [[nodiscard]] std::size_t get_aligned_block_size() const noexcept {
-    return (block_size_ + block_alignment_ - 1) / block_alignment_ * block_alignment_;
+  template <typename Func>
+  void for_each_block(Func&& func) const {
+    for (const auto& chunk : chunks_) {
+      char* current = static_cast<char*>(chunk.ptr);
+      for (size_t i = 0; i < blocks_per_chunk_; ++i) {
+        if (FixedBlockPool::get_used(current)) {
+          func(current);
+        }
+        current += block_size_;
+      }
+    }
   }
 
   void serialize(const std::string& filename) const {
+    auto start = std::chrono::high_resolution_clock::now();
+
     std::ofstream out(filename, std::ios::binary);
     if (!out) {
       throw std::runtime_error("Failed to open file for writing");
     }
-    // 写入元数据
+    // Write metadata
     out.write(reinterpret_cast<const char*>(&block_size_), sizeof(block_size_));
     out.write(reinterpret_cast<const char*>(&block_alignment_), sizeof(block_alignment_));
     out.write(reinterpret_cast<const char*>(&blocks_per_chunk_), sizeof(blocks_per_chunk_));
     const size_t num_chunks = chunks_.size();
     out.write(reinterpret_cast<const char*>(&num_chunks), sizeof(num_chunks));
 
-    // 写入每个 chunk 的数据
+    // Write data for each chunk
     for (const auto& chunk : chunks_) {
       assert(chunk.size == block_size_ * blocks_per_chunk_);
       out.write(static_cast<const char*>(chunk.ptr), static_cast<long>(chunk.size));
     }
     out.flush();
     out.close();
+    double data_size_mb = static_cast<double>((block_size_ * chunks_.size() * blocks_per_chunk_)) / (1024.0 * 1024.0);
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration<double>(end - start).count();
+
+    fmt::print("Serialized {}: size={:.3f}MB, time={}s, throughput={:.3f}MB/s\n",
+               filename,
+               data_size_mb,
+               duration,
+               (data_size_mb / duration));
   }
 
-  // 从文件反序列化
   void deserialize(const std::string& filename) {
+    auto start = std::chrono::high_resolution_clock::now();
+
     std::ifstream in(filename, std::ios::binary);
     if (!in) {
       throw std::runtime_error("Failed to open file for reading");
     }
 
-    // 读取元数据
+    // Read metadata
     std::size_t block_size, block_alignment, blocks_per_chunk, num_chunks;
     in.read(reinterpret_cast<char*>(&block_size), sizeof(block_size));
     in.read(reinterpret_cast<char*>(&block_alignment), sizeof(block_alignment));
     in.read(reinterpret_cast<char*>(&blocks_per_chunk), sizeof(blocks_per_chunk));
     in.read(reinterpret_cast<char*>(&num_chunks), sizeof(num_chunks));
 
-    // 验证参数合法性
+    // Validate parameters
     if (block_size != block_size_) {
       throw std::invalid_argument("Invalid block_size in file");
     }
@@ -208,14 +226,14 @@ class FixedBlockPool : public std::pmr::memory_resource {
       throw std::invalid_argument("Invalid blocks_per_chunk_ in file");
     }
 
-    // 读取每个 chunk 的数据并重建内存结构
+    // Read data for each chunk and rebuild memory structure
     const std::size_t chunk_size = block_size_ * blocks_per_chunk_;
     for (size_t i = 0; i < num_chunks; ++i) {
       void* chunk_ptr = upstream_->allocate(chunk_size, block_alignment_);
       in.read(static_cast<char*>(chunk_ptr), static_cast<long>(chunk_size));
-      // 将 chunk 添加到内存池
+      // Add chunk to memory pool
       chunks_.push_back({chunk_ptr, chunk_size, block_alignment});
-      // 重建 free_list_
+      // Rebuild free_list_
       char* current = static_cast<char*>(chunk_ptr);
       for (size_t j = 0; j < blocks_per_chunk; ++j) {
         void* block = current + j * block_size;
@@ -225,7 +243,23 @@ class FixedBlockPool : public std::pmr::memory_resource {
       }
     }
     in.close();
+
+    double data_size_mb = static_cast<double>((block_size_ * chunks_.size() * blocks_per_chunk_)) / (1024.0 * 1024.0);
+
+    auto end = std::chrono::high_resolution_clock::now();
+    auto duration = std::chrono::duration<double>(end - start).count();
+
+    fmt::print("Deserialized {}: size={:.3f}MB, time={}s, throughput={:.3f}MB/s\n",
+               filename,
+               data_size_mb,
+               duration,
+               (data_size_mb / duration));
   }
+
+  [[nodiscard]] const auto& get_chunks() const noexcept { return chunks_; }
+  [[nodiscard]] std::size_t get_block_size() const noexcept { return block_size_; }
+  [[nodiscard]] std::size_t get_block_alignment() const noexcept { return block_alignment_; }
+  [[nodiscard]] std::size_t get_blocks_per_chunk() const noexcept { return blocks_per_chunk_; }
 
  protected:
   // Core allocation function
