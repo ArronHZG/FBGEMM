@@ -51,7 +51,7 @@ class SynchronizedShardedMap {
     return mempools_.at(index % shards_.size()).get();
   }
 
-  auto getNumShards() { return shards_.size(); }
+  auto getNumShards() const { return shards_.size(); }
 
   auto getUsedMemSize() const {
     size_t used_mem_size = 0;
@@ -62,6 +62,55 @@ class SynchronizedShardedMap {
       used_mem_size += rlmap->size() * (sizeof(K) + sizeof(V) + block_size);
     }
     return used_mem_size;
+  }
+
+  void save(const std::string& filename) const {
+    std::ofstream out(filename, std::ios::binary);
+    if (!out) {
+      throw std::runtime_error("Failed to open file for writing");
+    }
+
+    const std::size_t num_shards = getNumShards();
+    out.write(reinterpret_cast<const char*>(&num_shards), sizeof(num_shards));
+    out.close();
+
+    // save every mempool
+    for (std::size_t i = 0; i < num_shards; ++i) {
+      std::string pool_filename = filename + ".pool." + std::to_string(i);
+      mempools_[i]->serialize(pool_filename);
+    }
+  }
+
+  void load(const std::string& filename) {
+    std::ifstream in(filename, std::ios::binary);
+    if (!in) {
+      throw std::runtime_error("Failed to open file for reading");
+    }
+
+    size_t num_shards;
+    in.read(reinterpret_cast<char*>(&num_shards), sizeof(num_shards));
+    in.close();
+
+    if (num_shards != getNumShards()) {
+      throw std::runtime_error("Shard count mismatch between file and map");
+    }
+
+    // first deserialize mempool
+    for (std::size_t i = 0; i < num_shards; ++i) {
+      std::string pool_filename = filename + ".pool." + std::to_string(i);
+      mempools_[i]->deserialize(pool_filename);
+    }
+
+    // load map from mempool
+    for (std::size_t shard_id = 0; shard_id < getNumShards(); ++shard_id) {
+      auto wlock = shards_[shard_id].wlock();
+      auto* mempool = mempools_[shard_id].get();
+      wlock->clear();
+      mempool->for_each_block([&wlock](void* block) {
+        auto key = FixedBlockPool::get_key(block);
+        wlock->emplace(key, reinterpret_cast<V>(block));
+      });
+    }
   }
 
  private:
